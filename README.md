@@ -601,6 +601,15 @@ link.click();
 | Auth | Cookie-based session (httpOnly) |
 
 ---
+## Star History
+
+<a href="https://www.star-history.com/?repos=solo12345689%2Fmoviebox-internal-api&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=solo12345689/moviebox-internal-api&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=solo12345689/moviebox-internal-api&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=solo12345689/moviebox-internal-api&type=date&legend=top-left" />
+ </picture>
+</a>
 
 ## 📁 Project Structure
 
