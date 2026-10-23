@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Cookie, Request
 from fastapi.responses import StreamingResponse
 import httpx
+import requests
+import urllib.request
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List, Dict
 from pydantic import BaseModel
@@ -92,22 +94,14 @@ def get_session(session_id: Optional[str] = None):
     }
     logger.info(f"Created new session: {sid}")
     
-    # Bootstrap fresh guest credentials by calling a public endpoint
+    # Bootstrap fresh guest credentials via official visitor-login
     try:
-        logger.info(f"Bootstrapping guest credentials for session {sid}...")
-        # X-Client-Status 1 forces guest token allocation from x-user response header
-        auth.is_logged_in = False
-        res = MovieBoxContent(client).get_categories(category_id=1, page=1)
-        # Scan response headers for x-user guest token in the client interceptor response update
-        for k, v in client.session.headers.items():
-            pass # client.session has updated or the client's auth object has updated
-        # Ensure we toggle auth.is_logged_in back to True (which uses Authorization: Bearer <Token>)
-        # so that details/play-info endpoints can use the bearer token
-        if auth.token and auth.token != "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjcwNjU5NDg0MTAyMTM4MTYyMzIsInV0cCI6MSwiZXhwIjoxNzkxNzMyMjMzLCJpYXQiOjE3ODM5NTU5MzN9.7iyEzTj4vWAbOF0oXwNnZ0p3Nc1QaO6K9eMiGFyVfGs":
+        logger.info(f"Bootstrapping guest credentials for session {sid} via visitor-login...")
+        login_res = client.visitor_login()
+        if login_res.get("status") == "success":
             logger.info(f"Bootstrap guest token success: {auth.token[:30]}... UID: {auth.user_id}")
-            auth.is_logged_in = True
         else:
-            logger.warning("Bootstrap guest token did not update credentials.")
+            logger.warning(f"visitor-login returned error: {login_res}")
     except Exception as e:
         logger.error(f"Failed to bootstrap guest session: {e}")
         
@@ -670,6 +664,8 @@ def get_tab_generic(tab_id: int, page: int = 1, session_id: Optional[str] = Cook
         logger.error(f"Generic Tab {tab_id} error: {e}")
         return {"code": 1, "message": str(e), "data": {"list": []}}
 
+
+
 @app.get("/game")
 def get_game(page: int = 1, session_id: Optional[str] = Cookie(None)):
     s = get_session(session_id)
@@ -723,13 +719,14 @@ def get_search_suggestions(response: Response, q: Optional[str] = None, session_
         return {"code": 0, "data": []}
 
 @app.get("/search")
-def search(response: Response, q: str, page: int = 1, session_id: Optional[str] = Cookie(None)):
+def search(response: Response, q: str, page: int = 1, subject_type: int = 0, type: Optional[int] = None, session_id: Optional[str] = Cookie(None)):
     s = get_session(session_id)
     response.set_cookie(key="session_id", value=s["id"], httponly=True, samesite="lax")
     try:
         if not q.strip():
             return {"code": 0, "data": {"items": []}}
-        res = s["content"].search(q.strip(), page=page)
+        effective_type = type if type is not None else subject_type
+        res = s["content"].search(q.strip(), page=page, subject_type=effective_type)
         logger.info(f"SEARCH RAW ({q}): {json.dumps(res, default=str)[:2000]}")
         items = _extract_items(res)
         return {"code": 0, "data": {"items": [map_item(i) for i in items[:40] if isinstance(i, dict)]}}
@@ -760,32 +757,6 @@ def get_room_detail(room_id: str, session_id: Optional[str] = Cookie(None)):
         logger.error(f"Room detail error: {e}")
         return {"code": 1, "data": {}}
 
-@app.get("/sports/live")
-def get_sports_live(session_id: Optional[str] = Cookie(None)):
-    s = get_session(session_id)
-    try:
-        # 1. Fetch live channels from MovieBox BFF
-        res = s["content"].get_live_channels()
-        data = res.get("data") or {}
-        items = data.get("list") or data.get("items") or []
-        channels = [map_item(c) for c in items]
-        
-        # 2. Append the specialized external aggregator link
-        # This is for sportslivetoday integration
-        channels.append({
-            "id": "external_sports_aggregator",
-            "title": "Live Sports Aggregator (Cricket/Football)",
-            "name": "Live Sports Today",
-            "type": "external_web",
-            "url": "https://sportslivetoday.com/live/detail?id=3552262265162844888&sportType=cricket",
-            "cover": "https://img.icons8.com/color/48/000000/cricket.png",
-            "tag": "LIVE"
-        })
-        
-        return {"code": 0, "data": channels}
-    except Exception as e:
-        logger.error(f"Sports live error: {e}")
-        return {"code": 1, "data": []}
 
 @app.get("/detail/{subject_id}")
 def get_detail(subject_id: str, depth: int = 0, session_id: Optional[str] = Cookie(None)):
@@ -996,33 +967,88 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
     res_ep = None if is_movie else episode
     
 
-    res = s["stream"].get_play_info(subject_id, season=res_se, episode=res_ep, resource_id=resource_id)
-    data = res.get("data", {})
-    logger.info(f"PLAY-INFO RAW RESPONSE: {res}")
-    streams = data.get("streamList") or data.get("streams") or []
+    # Helper: Detect fake/dummy upgrade notice clips (anti-piracy trap)
+    def is_deprecation_notice_url(u: str) -> bool:
+        if not u: return False
+        lower = u.lower()
+        return (
+            "notice.mp4" in lower
+            or ("macdn.aoneroom.com" in lower and "/other/" in lower)
+            or "1c7de0bd3393702d9191801f15f88f8d" in lower
+            or "9a0461bc39da389663bf3dbb17091d3f" in lower
+            or "80da52722ee7de7a4303290af6783424" in lower
+            or "b164fbfb4347792950bdfbfb563d39d9" in lower
+        )
+
+    # 1. Primary: Try play-info/v2, then fallback to play-info
+    res = s["stream"].get_play_info_v2(subject_id, season=res_se, episode=res_ep)
+    data = res.get("data", {}) if isinstance(res, dict) else {}
+    streams = data.get("streams") or data.get("streamList") or []
     
-    # OVERRIDE DUMMY URL WITH URLPREFIX DECODE
-    import base64
-    import re
-    for _st in streams:
-        _sc = _st.get("signCookie", "")
-        if "urlprefix=" in _sc:
-            match = re.search(r'urlprefix=([^:]+)', _sc)
-            if match:
-                b64_prefix = match.group(1)
-                b64_prefix += "=" * ((4 - len(b64_prefix) % 4) % 4)
-                try:
-                    prefix_url = base64.b64decode(b64_prefix).decode('utf-8')
-                    if prefix_url.startswith("http"):
-                        # MovieBox Dash/HLS streams use index.mpd for DASH streams
-                        _st["url"] = prefix_url + "index.mpd"
-                        logger.info(f"ANTI-PIRACY BYPASS: Decoded real URL -> {_st['url']}")
-                except Exception as e:
-                    logger.error(f"URLPREFIX decode error: {e}")
-    
-    # Fallback to resourceDetectors inside movie/show detail if no streams found in play-info
     if not streams:
-        logger.info(f"No streams from play-info. Checking resourceDetectors for subject {subject_id}...")
+        logger.info("play-info/v2 empty, falling back to legacy play-info...")
+        res = s["stream"].get_play_info(subject_id, season=res_se, episode=res_ep, resource_id=resource_id)
+        data = res.get("data", {}) if isinstance(res, dict) else {}
+        streams = data.get("streamList") or data.get("streams") or []
+    
+    logger.info(f"PLAY-INFO RESPONSE: code={res.get('code')}, found {len(streams)} streams")
+
+    # 2. Episode Resource Mirrors via /resource/v2 with isVip=true spoofing
+    try:
+        r2_se = 0 if is_movie else season
+        r2_ep = 0 if is_movie else episode
+        res2 = s["stream"].get_resources_v2(subject_id, season=r2_se, episode=r2_ep)
+        r2_items = res2.get("data", {}).get("list") or []
+        for r_item in r2_items:
+            r_link = r_item.get("resourceLink") or r_item.get("downloadUrl") or r_item.get("url")
+            if r_link:
+                streams.append({
+                    "url": r_link,
+                    "quality": f"{r_item.get('resolution')}p" if r_item.get('resolution') else "Auto",
+                    "signCookie": r_item.get("signCookie") or "",
+                    "codec": r_item.get("codecName") or "",
+                    "id": str(r_item.get("resourceId") or ""),
+                    "duration": r_item.get("duration") or 0
+                })
+        if r2_items:
+            logger.info(f"Appended {len(r2_items)} mirror resources from /resource/v2 (isVip=true)")
+    except Exception as e:
+        logger.warning(f"Failed to fetch /resource/v2 mirrors: {e}")
+
+    # 3. Detect anti-piracy trap clips and recover original media file via /resource-position/v2
+    recovered_streams = []
+    for _st in streams:
+        st_url = _st.get("url", "")
+        st_rid = str(_st.get("id") or "")
+        if is_deprecation_notice_url(st_url) and st_rid:
+            logger.info(f"Detected anti-piracy dummy video clip for resource {st_rid}. Engaging /resource-position/v2 failover...")
+            try:
+                rec_res = s["stream"].recover_resource_position_v2(subject_id, st_rid, st_url)
+                rec_list = rec_res.get("data", {}).get("list") or []
+                if rec_list:
+                    rec_item = rec_list[0]
+                    real_link = rec_item.get("resourceLink") or rec_item.get("url")
+                    if real_link and not is_deprecation_notice_url(real_link):
+                        logger.info(f"FAILOVER SUCCESS: Recovered real stream link: {real_link[:60]}...")
+                        recovered_streams.append({
+                            "url": real_link,
+                            "quality": f"{rec_item.get('resolution')}p" if rec_item.get('resolution') else _st.get("quality", "Auto"),
+                            "signCookie": rec_item.get("signCookie") or _st.get("signCookie") or "",
+                            "codec": rec_item.get("codecName") or _st.get("codec", ""),
+                            "id": str(rec_item.get("resourceId") or st_rid),
+                            "duration": rec_item.get("duration") or _st.get("duration", 0)
+                        })
+            except Exception as re_err:
+                logger.warning(f"Recovery via /resource-position/v2 failed: {re_err}")
+        elif not is_deprecation_notice_url(st_url):
+            recovered_streams.append(_st)
+
+    if recovered_streams:
+        streams = recovered_streams
+
+    # Fallback to resourceDetectors inside movie/show detail if no streams found
+    if not streams:
+        logger.info(f"No streams yet. Checking resourceDetectors for subject {subject_id}...")
         try:
             detectors = subject_detail.get("resourceDetectors") or []
             for det in detectors:
@@ -1037,7 +1063,7 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
                             if int(item_se) != int(season) or int(item_ep) != int(episode):
                                 continue
                     stream_url = res_item.get("resourceLink") or res_item.get("downloadUrl")
-                    if stream_url:
+                    if stream_url and not is_deprecation_notice_url(stream_url):
                         streams.append({
                             "url": stream_url,
                             "quality": f"{res_item.get('resolution')}p" if res_item.get("resolution") else "Auto",
@@ -1352,33 +1378,77 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
 
     logger.info(f"DURATION LOCK [{source_method}]: {subject_id} S{season}E{episode} -> {total_duration}s (Source: {runtime_str})")
 
-    # SUBTITLE DISCOVERY: Combine stream-internal and external BFF captions
-    all_subtitles = subtitles_source
+    # SUBTITLE DISCOVERY: Combine stream-internal and external BFF captions (TUI logic)
+    all_subtitles = []
+    seen_sub_urls = set()
+
+    def add_subtitle_track(sub: dict):
+        if not isinstance(sub, dict): return
+        url = sub.get("url") or ""
+        if not url or "aa348f2541d13ffe" in url:
+            return  # Blacklist known placeholder/dummy tracks
+        
+        # Check size (TUI drops corrupted/dummy <= 50 bytes responses)
+        try:
+            sz = int(sub.get("size") or 0)
+            if 0 < sz <= 50: return
+        except: pass
+
+        if url not in seen_sub_urls:
+            seen_sub_urls.add(url)
+            lan_name = sub.get("lanName") or sub.get("lan") or "Unknown"
+            sub["lanName"] = lan_name
+            all_subtitles.append(sub)
+
+    for st_sub in subtitles_source:
+        add_subtitle_track(st_sub)
+
     try:
         ext_hdrs = {"User-Agent": "Dalvik/2.1.0 (Linux; U; Android 13; SM-S918B Build/TP1A.220624.014)", "X-M-Version": "11.7.0"}
-        # Resolve Resource ID for External Subtitles
-        sub_resource_id = subject_id
-        try:
-            sd_res = s["client"].request('GET', '/wefeed-mobile-bff/subject-api/get', params={'subjectId': subject_id}, headers=ext_hdrs)
-            sd_detectors = sd_res.get('data', {}).get('resourceDetectors', [])
-            if sd_detectors:
-                sub_resource_id = sd_detectors[0].get('resourceId') or subject_id
-        except: pass
+        # Priority 1: Use the exact resourceId of the chosen working stream (like TUI)
+        sub_resource_id = str(working_stream.get("id") or "")
+        
+        # Priority 2: Fallback to metadata resourceDetectors
+        if not sub_resource_id or sub_resource_id == "None":
+            try:
+                sd_res = s["client"].request('GET', '/wefeed-mobile-bff/subject-api/get', params={'subjectId': subject_id}, headers=ext_hdrs)
+                sd_detectors = sd_res.get('data', {}).get('resourceDetectors', [])
+                if sd_detectors:
+                    sub_resource_id = str(sd_detectors[0].get('resourceId') or subject_id)
+            except:
+                sub_resource_id = subject_id
         
         ext_res = s["client"].request('GET', '/wefeed-mobile-bff/subject-api/get-ext-captions', 
-                                    params={'resourceId': sub_resource_id, 'subjectId': subject_id, 'episode': episode}, 
-                                    headers=ext_hdrs)
+                                      params={'resourceId': sub_resource_id, 'subjectId': subject_id, 'episode': episode}, 
+                                      headers=ext_hdrs)
         ext_list = ext_res.get("data", {}).get("extCaptions") or ext_res.get("data", {}).get("list") or []
         for esub in ext_list:
-            if not any(x.get("url") == esub.get("url") for x in all_subtitles):
-                all_subtitles.append(esub)
+            add_subtitle_track(esub)
     except Exception as se:
         logger.warning(f"External subtitle probe failed: {se}")
 
-    # PICK BEST SUBTITLE FOR MPV (Default to English if found)
+    # PICK BEST SUBTITLE FOR MPV / BROWSER (Default to English if found)
     best_sub = next((s.get("url") for s in all_subtitles if s.get("lan") == "en" or "english" in (s.get("lanName") or "").lower()), None)
+    if not best_sub and all_subtitles:
+        best_sub = all_subtitles[0].get("url")
 
-    # DIRECT NATIVE LINK (No Proxy)
+    # Referer and headers matching MovieBox-Tui: DASH/HLS requires https://sportslive.wine
+    is_dash_or_hls = (
+        working_stream.get("url", "").lower().endswith(".mpd")
+        or ".mpd" in working_stream.get("url", "").lower()
+        or working_stream.get("url", "").lower().endswith(".m3u8")
+        or ".m3u8" in working_stream.get("url", "").lower()
+    )
+    stream_referer = "https://sportslive.wine" if is_dash_or_hls else ""
+
+    headers_dict = {
+        "User-Agent": "ExoPlayerLib/2.19.1",
+        "Cookie": working_cookie or ""
+    }
+    if stream_referer:
+        headers_dict["Referer"] = stream_referer
+
+    # DIRECT NATIVE LINK
     return {
         "url": working_stream.get("url", ""),
         "cookie": working_cookie,
@@ -1389,19 +1459,9 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
         "streamId": working_stream.get("id"),
         "qualityList": list(set([st.get("quality") for st in streams if st.get("quality")])),
         "episode": episode,
-        "season": season
-    }
-
-    return {
-        "url": working_stream.get("url"),
-        "quality": working_stream.get("quality") or quality or "Auto",
-        "cookie": working_cookie,
-        "headers": {"User-Agent": "ExoPlayerLib/2.18.7", "Cookie": working_cookie or ""},
-        "subtitles": subtitles_source,
-        "isHls": working_stream.get("url", "").lower().endswith(".m3u8") or ".m3u8" in working_stream.get("url", "").lower(),
-        "streamId": working_stream.get("id"),
-        "qualityList": list(set([st.get("quality") for st in streams if st.get("quality")])),
-        "duration": total_duration
+        "season": season,
+        "referer": stream_referer,
+        "headers": headers_dict
     }
 
 import os
@@ -1726,18 +1786,18 @@ def launch_player(player: str, url: str, cookie: Optional[str] = None, subject_i
     # HIGH PARITY HEADERS matching latest app behavior
     ua = "ExoPlayerLib/2.19.1"
     
-    # Referer varies by CDN
-    if "sacdn2.hakunaymatata.com" in url:
-        referer = "https://apig.inmoviebox.com/" # REQUIRED FOR SACDN2
-    elif "hakunaymatata.com" in url:
-        referer = "https://www.movieboxpro.app/" # PROVEN REFERER FOR HAKUNA
-    else:
-        referer = "https://apig.inmoviebox.com/"
+    # Referer: Only set for DASH (.mpd) or HLS (.m3u8).
+    # Direct signed MP4 streams on BCDN / hakunaymatata throttle with 429 if Referer is sent.
+    referer = None
+    if ".mpd" in url.lower() or ".m3u8" in url.lower():
+        referer = "https://sportslive.wine"  # MovieBox TUI / DASH whitelisted referer
     
     if player.lower() == "mpv":
-        cmd = ["mpv", f"--user-agent={ua}", f"--referrer={referer}", "--cache=yes"]
+        cmd = ["mpv", f"--user-agent={ua}", "--cache=yes"]
+        if referer:
+            cmd.append(f"--referrer={referer}")
         # Regional titles sometimes need ytdl disabled, but standard content needs it enabled
-        if "hakunaymatata.com" in url:
+        if "hakunaymatata.com" in url or ".mp4" in url.lower():
             cmd.append("--ytdl=no")
         if title: cmd.append(f'--force-media-title={title}')
         if duration > 0: cmd.append(f"--length={duration}")
@@ -1750,7 +1810,9 @@ def launch_player(player: str, url: str, cookie: Optional[str] = None, subject_i
         if subtitle_url: cmd.append(f'--sub-file={subtitle_url}')
         cmd.append(url)
     else:
-        cmd = ["vlc", f"--http-user-agent={ua}", f"--http-referrer={referer}", "--network-caching=5000"]
+        cmd = ["vlc", f"--http-user-agent={ua}", "--network-caching=5000"]
+        if referer:
+            cmd.append(f"--http-referrer={referer}")
         if cookie: cmd.append(f':http-header-fields=Cookie: {cookie}')
         if start_time > 0: cmd.append(f"--start-time={start_time}")
         if subtitle_url: cmd.append(f'--sub-file={subtitle_url}')

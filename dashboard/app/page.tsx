@@ -97,12 +97,12 @@ export default function MovieBoxDashboard() {
 
       const [res, rankRes, suggRes] = await Promise.all([
         item.api(),
-        movieApi.getRankings(item.tabId),
+        tabId === 'live' ? Promise.resolve({ data: [] }) : movieApi.getRankings(item.tabId),
         movieApi.getSearchSuggestions()
       ]);
 
       if (res.data?.list) setHomeSections(res.data.list);
-      if (rankRes.data) setRankingSections(rankRes.data);
+      setRankingSections(rankRes.data || []);
       
       if (suggRes.data) {
         setSearchSuggestions(suggRes.data);
@@ -213,6 +213,11 @@ export default function MovieBoxDashboard() {
     const id = movie.subjectId || movie.id;
     if (!id) return;
     
+    if (movie.actionType === 'external_web' && (movie.streamUrl || movie.deepLink)) {
+        window.open(movie.streamUrl || movie.deepLink, '_blank', 'noopener,noreferrer');
+        return;
+    }
+
     if (movie.isPost && movie.streamUrl) {
         try {
             await movieApi.launchPlayer('mpv', movie.streamUrl, {

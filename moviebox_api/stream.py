@@ -7,6 +7,64 @@ class MovieBoxStream:
         self.client = client
         self.sign_cookie_cache = {} # subject_id: {cookie, expiry}
 
+    def get_play_info_v2(self, subject_id: str, season: Optional[int] = None, episode: Optional[int] = None) -> Dict:
+        """Calls the play-info/v2 API endpoint."""
+        params = {"subjectId": subject_id}
+        if season is not None and season > 0:
+            params["se"] = season
+        if episode is not None and episode > 0:
+            params["ep"] = episode
+
+        return self.client.request(
+            "GET",
+            "/wefeed-mobile-bff/subject-api/play-info/v2",
+            params=params,
+            headers={
+                "User-Agent": "MovieBox/4.0.02 (Android 14; Pixel 6)",
+                "X-M-Version": "4.0.02"
+            }
+        )
+
+    def get_resources_v2(self, subject_id: str, season: int = 0, episode: int = 0, page: int = 1, per_page: int = 20) -> Dict:
+        """Fetches resource mirrors with isVip=true spoofing."""
+        params = {
+            "subjectId": subject_id,
+            "page": page,
+            "perPage": per_page,
+            "all": 0,
+            "startPosition": 1,
+            "endPosition": 1,
+            "pagerMode": 2,
+            "resolution": 0,
+            "isVip": "true"
+        }
+        if season > 0 or episode > 0:
+            params["se"] = season
+            params["epFrom"] = episode
+            params["epTo"] = episode
+
+        return self.client.request(
+            "GET",
+            "/wefeed-mobile-bff/subject-api/resource/v2",
+            params=params
+        )
+
+    def recover_resource_position_v2(self, subject_id: str, resource_id: str, fail_url: str) -> Dict:
+        """Calls resource-position/v2 to recover original media link for trap clips."""
+        params = {
+            "subjectId": subject_id,
+            "resourceId": resource_id,
+            "failUrl": fail_url,
+            "failCode": "404",
+            "resourceNum": "0",
+            "isVip": "true"
+        }
+        return self.client.request(
+            "GET",
+            "/wefeed-mobile-bff/subject-api/resource-position/v2",
+            params=params
+        )
+
     def get_play_info(self, subject_id: str, season: int = 1, episode: int = 1, resource_id: Optional[str] = None) -> Dict:
         """Calls the play-info API endpoint."""
         params = {

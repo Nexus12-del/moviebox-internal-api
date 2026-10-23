@@ -96,7 +96,8 @@ const VideoPlayer = memo(({
             if (art.hls) art.hls.destroy();
             const hls = new Hls({
               xhrSetup: function (xhr: any) {
-                xhr.setRequestHeader('User-Agent', 'ExoPlayerLib/2.18.7');
+                xhr.setRequestHeader('User-Agent', 'ExoPlayerLib/2.19.1');
+                xhr.setRequestHeader('Referer', 'https://sportslive.wine');
                 if (cookie) {
                   xhr.setRequestHeader('Cookie', cookie);
                 }
@@ -126,7 +127,8 @@ const VideoPlayer = memo(({
             player.extend("RequestModifier", function () {
               return {
                 modifyRequestHeader: function (xhr: any) {
-                  xhr.setRequestHeader('User-Agent', 'ExoPlayerLib/2.18.7');
+                  xhr.setRequestHeader('User-Agent', 'ExoPlayerLib/2.19.1');
+                  xhr.setRequestHeader('Referer', 'https://sportslive.wine');
                   if (cookie) {
                     xhr.setRequestHeader('Cookie', cookie);
                   }

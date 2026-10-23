@@ -25,8 +25,13 @@ export interface MovieItem {
   episode?: number;
   isPost?: boolean;
   streamUrl?: string;
+  deepLink?: string;
   actionType?: string;
   categoryId?: string;
+  isLive?: boolean;
+  isEnded?: boolean;
+  playSources?: any[];
+  replays?: any[];
 }
 
 export const movieApi = {

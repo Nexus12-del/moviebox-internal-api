@@ -75,6 +75,22 @@ class MovieBoxClient:
         
         return {"status": "error", "message": res.get("msg") or "Failed to send OTP", "res": res}
 
+    def visitor_login(self) -> Dict[str, Any]:
+        """
+        Dynamically authenticates as guest via official visitor-login.
+        POST /wefeed-mobile-bff/user-api/visitor-login
+        """
+        res = self.request("POST", "/wefeed-mobile-bff/user-api/visitor-login", data={})
+        if res.get("code") == 0 and "data" in res:
+            data = res["data"]
+            token = data.get("token")
+            user_id = str(data.get("userId") or data.get("uid") or "")
+            if token:
+                self.auth.update_session(token, user_id=user_id)
+                logger.info(f"Dynamic visitor-login acquired fresh token for user: {user_id}")
+                return {"status": "success", "token": token, "user_id": user_id}
+        return {"status": "error", "message": res.get("msg") or res.get("message") or "visitor-login failed", "res": res}
+
     def login(self, account: str, password: str, auth_type: int = 1):
         hashed_pwd = md5_hex(password)
         payload = {

@@ -13,12 +13,31 @@ class MovieBoxContent:
             data={"page": page, "pageSize": page_size}
         )
 
-    def search(self, keyword: str, page: int = 1, page_size: int = 20) -> Dict:
-        """Searches for content based on keyword."""
+    def search(self, keyword: str, page: int = 1, page_size: int = 20, subject_type: int = 0) -> Dict:
+        """Searches for content based on keyword using V2 endpoint (matching MovieBox-Tui)."""
+        payload = {
+            "keyword": keyword,
+            "page": page,
+            "perPage": page_size,
+            "pageSize": page_size,
+            "subjectType": subject_type,
+            "type": subject_type,
+            "q": keyword
+        }
+        try:
+            res = self.client.request(
+                "POST",
+                "/wefeed-mobile-bff/subject-api/search/v2",
+                data=payload
+            )
+            if res and res.get("code") == 0:
+                return res
+        except Exception:
+            pass
         return self.client.request(
             "POST",
             "/wefeed-mobile-bff/subject-api/search",
-            data={"keyword": keyword, "q": keyword, "page": page, "pageSize": page_size, "type": 0}
+            data=payload
         )
 
     def get_movie_detail(self, subject_id: str) -> Dict:
