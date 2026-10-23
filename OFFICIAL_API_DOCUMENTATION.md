@@ -27,15 +27,16 @@ The API servers utilize strict header-based filtering to block unauthorized web 
 | `Authorization` | `Bearer <Token>` | User session token (refreshed via response `x-user`). |
 
 ### **Cryptographic Token Handshake (`X-Client-Token` & Dynamic Guest Bootstrapping)**
-To authorize requests without an active login session, the client must perform a dynamic guest bootstrapping handshake:
-1. **Dynamic Guest Bootstrap Handshake**: Pinging `/wefeed-mobile-bff/tab-operating?host=api.inmoviebox.com&page=1&pageSize=24&tabId=1` with a formatted anonymous signature first.
-2. **Dynamic Header Token Extraction**: The API gateway interceptor will evaluate the anonymous request and issue a dynamic guest session token returned in the headers (e.g. `x-user`).
-3. **Session Bearer Injection**: This dynamic token is captured in memory and injected as a `Bearer <token>` inside the `Authorization` header for all subsequent content metadata queries, completely replacing static guest tokens.
-4. **Alternative Signature Generation (`X-Client-Token`)**:
-   * Get the current Unix epoch timestamp in milliseconds: `timestamp = str(int(time.time() * 1000))`
-   * Reverse the timestamp characters: `reversed = timestamp[::-1]`
-   * Calculate the MD5 hex digest of the reversed timestamp: `hash = md5(reversed)`
-   * Concatenate to build the token: `X-Client-Token: timestamp + "," + hash`
+To authorize requests without an active login session, the client can bootstrap credentials using either:
+1. **Direct Visitor Login**: `POST /wefeed-mobile-bff/user-api/visitor-login` with payload `{}` to obtain a fresh guest `token` and `userId`.
+2. **Dynamic Header Token Extraction**: Pinging `/wefeed-mobile-bff/tab-operating?host=api.inmoviebox.com&page=1&pageSize=24&tabId=1` to extract the issued guest token from the `x-user` response header.
+3. **Session Bearer Injection**: The acquired token is injected as `Bearer <token>` inside the `Authorization` header for subsequent queries.
+4. **Token Generation (`X-Client-Token`)**:
+   * Get Unix epoch timestamp in milliseconds: `timestamp = str(int(time.time() * 1000))`
+   * Reverse timestamp characters: `reversed = timestamp[::-1]`
+   * Calculate MD5 hex digest: `hash = md5(reversed)`
+   * Token format: `X-Client-Token: timestamp + "," + hash`
+
 
 ### **Cryptographic App Signature (`x-tr-signature`)**
 For requests going to the Android BFF endpoints, the server validates a signature of the HTTP request payload and headers:
@@ -115,6 +116,15 @@ The application primarily communicates with clusters like `api6.aoneroom.com` an
 *   **Play Info (The Resolver)**: `GET /wefeed-mobile-bff/subject-api/play-info`
     *   *Params*: `subjectId`, `se` (Season), `ep` (Episode), `quality`, `resourceId`
     *   *Returns*: Stream URLs (`streamList`) and internal subtitles (`subTitleList`).
+*   **Play Info V2**: `GET /wefeed-mobile-bff/subject-api/play-info/v2`
+    *   *Params*: `subjectId`, `se` (Season), `ep` (Episode)
+    *   *Returns*: Stream manifest URLs (`streams`), `displayResolutions`, and `cdnThrottleLevel`.
+*   **Resource Mirror V2**: `GET /wefeed-mobile-bff/subject-api/resource/v2`
+    *   *Params*: `subjectId`, `se`, `epFrom`, `epTo`, `page`, `perPage`, `resolution`, `isVip=true`, `pagerMode=2`
+    *   *Returns*: User-generated and mirror resource streams filtered by episode range.
+*   **Resource Position / Failover Recovery V2**: `GET /wefeed-mobile-bff/subject-api/resource-position/v2`
+    *   *Params*: `subjectId`, `resourceId`, `failUrl`, `failCode=404`, `resourceNum=0`, `isVip=true`
+    *   *Returns*: Alternate fallback stream URL when primary link fails or hits an anti-piracy trap video.
 *   **External Subtitles**: `GET /wefeed-mobile-bff/subject-api/get-ext-captions`
     *   *Params*: `resourceId`, `subjectId`, `episode`
     *   *Notes*: Returns high-quality CloudFront-signed `.srt` tracks.
@@ -175,6 +185,12 @@ In newer versions, the API deliberately attempts to trap unofficial clients and 
     3.  Decode the Base64 string to reveal the hidden base CDN server path (e.g., `https://sbcdn2.hakunaymatata.com/dash/.../`).
     4.  Append `index.mpd` (for MPEG-DASH streams) or `index.m3u8` (for HLS streams) to the end of that hidden path to construct the true, playable stream manifest URL, entirely ignoring the fake `url` field.
 
+### **Phase 6: Resource Mirror VIP Parameter Spoofing (`isVip=true`)**
+While primary playback resolvers strictly enforce subscription entitlements against the user account token, secondary mirror and failover endpoints rely on client-supplied query parameters:
+*   **Target Endpoints**: `/wefeed-mobile-bff/subject-api/resource/v2` and `/wefeed-mobile-bff/subject-api/resource-position/v2`.
+*   **Mechanism**: Include `isVip=true` in the URL query parameters when generating the canonical signature (`x-tr-signature`).
+*   **Bypass Effect**: Unlocks 1080p/4K resolution tiers and direct fallback mirrors without requiring a paid VIP subscription or logged-in account status.
+
 ---
 
 ## 4. Internal Secrets (Static)
@@ -224,6 +240,7 @@ The following endpoints were extracted directly from the application's service m
 *   `/wefeed-mobile-bff/subject-api/have-seen`
 *   `/wefeed-mobile-bff/subject-api/like`
 *   `/wefeed-mobile-bff/subject-api/play-info`
+*   `/wefeed-mobile-bff/subject-api/play-info/v2`: V2 video stream resolver with throttle and resolution metadata.
 *   `/wefeed-mobile-bff/subject-api/play-next`
 *   `/wefeed-mobile-bff/subject-api/play-url`
 *   `/wefeed-mobile-bff/subject-api/ranking-list`
@@ -237,6 +254,7 @@ The following endpoints were extracted directly from the application's service m
 *   `/wefeed-mobile-bff/subject-api/start-download-resource`: Initialize download tracking.
 *   `/wefeed-mobile-bff/subject-api/finish-download-resource`: Complete download reporting.
 *   `/wefeed-mobile-bff/subject-api/resource`: Fetch raw resource metadata.
+*   `/wefeed-mobile-bff/subject-api/resource/v2`: Filterable episode/season resource mirror query.
 *   `/wefeed-mobile-bff/subject-api/search-rank`: High-conversion search suggestions.
 *   `/wefeed-mobile-bff/subject-api/topic-list`
 *   `/wefeed-mobile-bff/subject-api/trending/v2`
@@ -248,6 +266,7 @@ The following endpoints were extracted directly from the application's service m
 *   `/wefeed-mobile-bff/subject-api/list`: Lists items within subjects.
 *   `/wefeed-mobile-bff/subject-api/play-related-rec`: Related content suggestions post-resolution.
 *   `/wefeed-mobile-bff/subject-api/resource-position`: Tracking position of static resources.
+*   `/wefeed-mobile-bff/subject-api/resource-position/v2`: Failover stream link recovery for broken/dummy clips.
 *   `/wefeed-mobile-bff/subject-api/search-rank/v2`: V2 query rank suggestions.
 *   `/wefeed-mobile-bff/subject-api/search-suggest`: Instant search suggestions.
 *   `/wefeed-mobile-bff/subject-api/search/v2`: Optimized V2 search endpoint.
@@ -272,6 +291,7 @@ The following endpoints were extracted directly from the application's service m
 *   `/wefeed-mobile-bff/user-api/reset-password`
 *   `/wefeed-mobile-bff/user-api/third-login`
 *   `/wefeed-mobile-bff/user-api/unblock`
+*   `/wefeed-mobile-bff/user-api/visitor-login`: Direct guest JWT and user identity bootstrap.
 *   `/wefeed-mobile-bff/user-api/profile/v3`: Advanced user identity profile.
 *   `/wefeed-mobile-bff/user-api/submit-prefer`: Save user category preferences.
 
