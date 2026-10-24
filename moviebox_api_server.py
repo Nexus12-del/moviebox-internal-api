@@ -18,7 +18,6 @@ import re
 from urllib.parse import quote
 from moviebox_api import MovieBoxClient, MovieBoxAuth, MovieBoxContent, MovieBoxStream, MovieBoxUser
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -27,7 +26,6 @@ app = FastAPI(title="MovieBox Unofficial API Backend")
 
 @app.get("/")
 def root_health():
-    """Lightweight Render/Uvicorn health endpoint."""
     return {"status": "ok", "service": "moviebox-internal-api"}
 
 
@@ -35,7 +33,6 @@ def root_health():
 def health_check():
     return {"status": "ok"}
 
-# Enable CORS for local and deployed Wotchly frontends.
 _allowed_origins = [
     origin.strip()
     for raw in (os.getenv("CORS_ORIGINS", ""), os.getenv("FRONTEND_URL", ""))
@@ -864,7 +861,7 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
         is_movie = (str(subject_detail.get("subjectType") or subject_detail.get("type")) == "1")
     except: is_movie = False
 
-    logger.info(f"RESOLVING STREAM: ID={subject_id} Type={'Movie' if is_movie else 'Series'} Resource={resource_id}")
+    logger.info(f"RESOLVING STREAM: ID={subject_id} Type={'Movie' if is_movie else 'Series'} Resource={resource_id} Quality={quality}")
     
     res_se = None if is_movie else season
     res_ep = None if is_movie else episode
@@ -976,6 +973,25 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
             
     global_cookie = res.get("signCookie") or data.get("signCookie") or s["client"].session.cookies.get("signCookie") or s["auth"].token
     logger.info(f"Phase 1 - Primary Result: {len(streams)} streams found (code: {res.get('code')}) (Cookie: {'YES' if global_cookie else 'NO'})")
+    
+    # ⚠️ NOUVEAU : FILTRE QUALITÉ — garde uniquement la qualité demandée
+    if quality and quality != "auto":
+        q_wanted = str(quality).replace("p", "").replace("P", "").strip()
+        if q_wanted.isdigit():
+            q_num = int(q_wanted)
+            def _qnum(st):
+                q = str(st.get("quality", "0")).replace("p", "").replace("P", "").strip()
+                try: return int(q) if q.isdigit() else 0
+                except: return 0
+            filtered = [st for st in streams if _qnum(st) == q_num]
+            if filtered:
+                logger.info(f"QUALITY FILTER: {q_wanted}p → {len(filtered)} streams retenus (sur {len(streams)})")
+                streams = filtered
+            else:
+                available_q = sorted(set([_qnum(st) for st in streams if _qnum(st) > 0]), reverse=True)
+                logger.warning(f"QUALITY FILTER: aucune {q_wanted}p. Disponibles: {available_q}. On garde tout.")
+    # ⚠️ FIN NOUVEAU
+    
     import requests
     
     working_stream = None
@@ -1092,16 +1108,22 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
     is_hevc = any("h265" in st.get("url", "").lower() or "x265" in st.get("url", "").lower() or "hev1" in st.get("url", "").lower() or "h.265" in st.get("url", "").lower() for st in streams)
     h265_candidate = next((st for st in streams if any(bad in st.get("url", "").lower() for bad in ["h265", "x265", "hev1", "h.265"])), None)
     
-    # ⚠️ AJOUT : FORCE H.264 FOR MOBILE COMPATIBILITY
-    h264_candidate = next((st for st in streams if "h264" in st.get("url", "").lower()), None)
-    if h264_candidate:
-        logger.info(f"FORCING H.264 for mobile compat: {h264_candidate.get('url', '')[:60]}")
-        working_stream = h264_candidate
+    # ⚠️ MODIFIÉ : FORCE best H.264 (trié par qualité desc)
+    h264_candidates = [st for st in streams if "h264" in st.get("url", "").lower()]
+    if h264_candidates:
+        def _qnum_sort(st):
+            q = str(st.get("quality", "0")).replace("p", "").replace("P", "").strip()
+            try: return int(q) if q.isdigit() else 0
+            except: return 0
+        h264_candidates.sort(key=_qnum_sort, reverse=True)
+        working_stream = h264_candidates[0]
         working_cookie = working_stream.get("signCookie") or global_cookie or ""
+        logger.info(f"FORCING best H.264 ({working_stream.get('quality')}): {working_stream.get('url', '')[:60]}")
     elif is_hevc and h265_candidate:
         logger.info(f"Detected HEVC/H.265 (no H.264 available). Serving H.265...")
         working_stream = h265_candidate
         working_cookie = working_stream.get("signCookie") or global_cookie or ""
+    # ⚠️ FIN MODIFIÉ
 
     if not working_stream:
         logger.info(f"Entering Phase 4 Cluster Rotation for {subject_id}")
@@ -1298,19 +1320,173 @@ def get_stream(subject_id: str, season: int = 1, episode: int = 1, quality: Opti
         "subtitle_url": best_sub,
         "isHls": working_stream.get("url", "").lower().endswith(".m3u8") or ".m3u8" in working_stream.get("url", "").lower(), 
         "streamId": working_stream.get("id"),
-        "qualityList": list(set([st.get("quality") for st in streams if st.get("quality")])),
+        "qualityList": sorted(
+            list(set([st.get("quality") for st in streams if st.get("quality")])),
+            key=lambda q: int(str(q).replace("p", "")) if str(q).replace("p", "").isdigit() else 0,
+            reverse=True
+        ),
         "episode": episode,
         "season": season,
         "referer": stream_referer,
         "headers": headers_dict
     }
 
-# ⚠️ AJOUT : ROUTE PROXY VIDÉO (SSL & BYPASS)
+# ⚠️ NOUVEAU : ENDPOINT /streams qui renvoie TOUTES les qualités disponibles
+@app.get("/streams/{subject_id}")
+def get_all_streams(
+    subject_id: str,
+    season: int = 1,
+    episode: int = 1,
+    session_id: Optional[str] = Cookie(None)
+):
+    """
+    Retourne TOUTES les qualités disponibles (360p, 480p, 720p, 1080p, ...)
+    Chaque qualité a son URL de proxy dédiée.
+    """
+    s = get_session(session_id)
+    try:
+        subject_detail = s["content"].get_movie_detail(subject_id).get("data") or {}
+        is_movie = (str(subject_detail.get("subjectType") or subject_detail.get("type")) == "1")
+    except:
+        is_movie = False
+
+    logger.info(f"LIST ALL STREAMS: ID={subject_id} Type={'Movie' if is_movie else 'Series'}")
+    res_se = None if is_movie else season
+    res_ep = None if is_movie else episode
+
+    def is_deprecation_notice_url(u: str) -> bool:
+        if not u: return False
+        lower = u.lower()
+        return (
+            "notice.mp4" in lower
+            or ("macdn.aoneroom.com" in lower and "/other/" in lower)
+            or "1c7de0bd3393702d9191801f15f88f8d" in lower
+            or "9a0461bc39da389663bf3dbb17091d3f" in lower
+            or "80da52722ee7de7a4303290af6783424" in lower
+            or "b164fbfb4347792950bdfbfb563d39d9" in lower
+        )
+
+    # 1. Play-info
+    res = s["stream"].get_play_info_v2(subject_id, season=res_se, episode=res_ep)
+    data = res.get("data", {}) if isinstance(res, dict) else {}
+    streams = data.get("streams") or data.get("streamList") or []
+
+    if not streams:
+        res = s["stream"].get_play_info(subject_id, season=res_se, episode=res_ep)
+        data = res.get("data", {}) if isinstance(res, dict) else {}
+        streams = data.get("streamList") or data.get("streams") or []
+
+    # 2. Resource mirrors
+    try:
+        r2_se = 0 if is_movie else season
+        r2_ep = 0 if is_movie else episode
+        res2 = s["stream"].get_resources_v2(subject_id, season=r2_se, episode=r2_ep)
+        r2_items = res2.get("data", {}).get("list") or []
+        for r_item in r2_items:
+            r_link = r_item.get("resourceLink") or r_item.get("downloadUrl") or r_item.get("url")
+            if r_link:
+                streams.append({
+                    "url": r_link,
+                    "quality": f"{r_item.get('resolution')}p" if r_item.get('resolution') else "Auto",
+                    "signCookie": r_item.get("signCookie") or "",
+                    "codec": r_item.get("codecName") or "",
+                    "id": str(r_item.get("resourceId") or ""),
+                })
+    except Exception as e:
+        logger.warning(f"Mirror fetch failed: {e}")
+
+    # 3. Anti-piracy recovery
+    recovered = []
+    for _st in streams:
+        st_url = _st.get("url", "")
+        st_rid = str(_st.get("id") or "")
+        if is_deprecation_notice_url(st_url) and st_rid:
+            try:
+                rec_res = s["stream"].recover_resource_position_v2(subject_id, st_rid, st_url)
+                rec_list = rec_res.get("data", {}).get("list") or []
+                if rec_list:
+                    rec_item = rec_list[0]
+                    real_link = rec_item.get("resourceLink") or rec_item.get("url")
+                    if real_link and not is_deprecation_notice_url(real_link):
+                        recovered.append({
+                            "url": real_link,
+                            "quality": f"{rec_item.get('resolution')}p" if rec_item.get('resolution') else _st.get("quality", "Auto"),
+                            "signCookie": rec_item.get("signCookie") or _st.get("signCookie") or "",
+                            "codec": rec_item.get("codecName") or _st.get("codec", ""),
+                            "id": str(rec_item.get("resourceId") or st_rid),
+                        })
+            except Exception as e:
+                logger.warning(f"Recovery failed: {e}")
+        elif not is_deprecation_notice_url(st_url):
+            recovered.append(_st)
+
+    if recovered:
+        streams = recovered
+
+    # 4. Group by quality — pick BEST codec per quality (H.264 > others > H.265)
+    by_quality = {}
+    for st in streams:
+        q_raw = str(st.get("quality", "")).replace("p", "").replace("P", "").strip()
+        try:
+            qn = int(q_raw) if q_raw.isdigit() else 0
+        except:
+            qn = 0
+        if qn == 0:
+            continue
+
+        url_l = st.get("url", "").lower()
+        is_h264 = "h264" in url_l
+        is_h265 = "h265" in url_l or "x265" in url_l or "hev1" in url_l
+        priority = 0 if is_h264 else (2 if is_h265 else 1)
+
+        if qn not in by_quality or priority < by_quality[qn]["priority"]:
+            codec = "h264" if is_h264 else ("h265" if is_h265 else "auto")
+            by_quality[qn] = {
+                "quality": f"{qn}p",
+                "qualityNum": qn,
+                "url": st.get("url"),
+                "proxyUrl": f"/stream-proxy/{subject_id}?season={season}&episode={episode}&quality={qn}p",
+                "codec": codec,
+                "priority": priority,
+                "streamId": st.get("id"),
+            }
+
+    result = sorted(by_quality.values(), key=lambda x: x["qualityNum"], reverse=True)
+
+    # 5. Duration
+    duration = 0
+    runtime_str = subject_detail.get("runtime") or subject_detail.get("duration") or "0"
+    try:
+        runtime_str = str(runtime_str)
+        if ":" in runtime_str:
+            parts = [int(p) for p in runtime_str.split(':')]
+            if len(parts) == 3: duration = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            elif len(parts) == 2: duration = parts[0] * 60 + parts[1]
+        else:
+            duration = int(''.join(filter(str.isdigit, runtime_str))) * 60
+    except:
+        pass
+
+    logger.info(f"STREAMS FOUND: {[s['quality'] for s in result]}")
+
+    return {
+        "streams": result,
+        "qualities": [s["quality"] for s in result],
+        "duration": duration,
+        "isMovie": is_movie,
+        "season": season,
+        "episode": episode,
+        "subtitles": data.get("subTitleList", []),
+    }
+# ⚠️ FIN NOUVEAU
+
+# ⚠️ MODIFIÉ : stream_proxy accepte maintenant quality
 @app.get("/stream-proxy/{subject_id}")
 async def stream_proxy(
     subject_id: str,
     season: int = 1,
     episode: int = 1,
+    quality: str = "1080p",
     request: Request = None,
     session_id: Optional[str] = Cookie(None)
 ):
@@ -1319,14 +1495,14 @@ async def stream_proxy(
     Résout : SSL invalide du CDN + geo-restriction éventuelle.
     """
     try:
-        stream_info = get_stream(subject_id, season, episode, session_id=session_id)
+        stream_info = get_stream(subject_id, season, episode, quality=quality, session_id=session_id)
         url = stream_info.get("url")
         cookie = stream_info.get("cookie")
         
         if not url:
             raise HTTPException(status_code=404, detail="Aucun stream trouvé")
         
-        logger.info(f"PROXY: {url[:80]}...")
+        logger.info(f"PROXY (quality={quality}): {url[:80]}...")
         
         headers = {"User-Agent": "ExoPlayerLib/2.19.1"}
         if cookie:
@@ -1381,7 +1557,7 @@ async def stream_proxy(
     except Exception as e:
         logger.error(f"PROXY ERROR: {e}")
         raise HTTPException(status_code=502, detail=f"Proxy error: {str(e)}")
-# ⚠️ FIN AJOUT
+# ⚠️ FIN MODIFIÉ
 
 import os
 
@@ -1479,6 +1655,7 @@ async def proxy_download(
             "Content-Disposition": f"attachment; filename=\"{filename}\""
         }
     )
+
 @app.get("/subtitles/{subject_id}")
 def get_subtitles(subject_id: str, se: int = 1, ep: int = 1, session_id: Optional[str] = Cookie(None)):
     s = get_session(session_id)
@@ -1520,6 +1697,7 @@ def mark_have_seen(subject_id: str = None, progress: int = 0, total: int = 0, se
     if not subject_id: return {"code": -1, "msg": "Missing ID"}
     res = s["user"].report_history(subject_id, progress, total)
     return res
+
 @app.post("/analytics/operation")
 def track_operation(action: str, target: str, session_id: Optional[str] = Cookie(None)):
     s = get_session(session_id)
